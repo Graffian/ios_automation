@@ -330,40 +330,47 @@ def run():
         print(f"  [WDA] Could not connect: {e}")
         print("  Make sure WebDriverAgent is running on port 8100.\n")
 
+    played: set[str] = set()   # words already used on this board
+    last_letters: list = []
+
     while True:
         try:
-            print("Taking screenshot...")
+            # ── Screenshot + OCR ──────────────────────────────────────
             img = take_screenshot()
-
             letters = ocr_board(img)
-            bad = letters.count("?")
-            if bad:
-                print(f"  {bad} tile(s) unreadable — retrying in 1s...")
-                time.sleep(1)
+
+            if letters.count("?") > 0:
+                print(f"  Unreadable tiles — retrying...")
+                time.sleep(0.8)
                 continue
 
-            t0 = time.perf_counter()
-            results = solve_board(letters, words, prefixes)
-            elapsed = time.perf_counter() - t0
-            print(f"  {len(results)} words found in {elapsed:.3f}s")
+            # ── If the board changed, reset played set ─────────────────
+            if letters != last_letters:
+                played.clear()
+                last_letters = letters[:]
+                t0 = time.perf_counter()
+                results = solve_board(letters, words, prefixes)
+                elapsed = time.perf_counter() - t0
+                preview = ", ".join(w.upper() for w in list(results)[:6])
+                print(f"  {len(results)} words  ({elapsed:.3f}s)  Top: {preview}")
 
-            if not results:
-                print("  No words — waiting for new board...")
-                time.sleep(2)
+            # ── Pick best word not yet played ─────────────────────────
+            # Sort: longest first, then alphabetical as tiebreak
+            remaining = [(w, p) for w, p in results.items() if w not in played]
+            if not remaining:
+                print("  All words played — waiting for new board...")
+                time.sleep(1.5)
                 continue
 
-            top = list(results.items())[:20]
-            preview = ", ".join(w.upper() for w, _ in top[:8])
-            print(f"  Top: {preview}{'...' if len(top) > 8 else ''}\n")
+            word, path = remaining[0]
+            played.add(word)
 
-            for word, path in top:
-                print(f"  ▶  {word.upper():<10}  tiles={path}", end="  ")
-                ok = swipe_path(path)
-                print("✓" if ok else "✗ SWIPE FAILED")
-                time.sleep(BOARD_WAIT)
+            print(f"  ▶  {word.upper():<10}  tiles={path}", end="  ")
+            ok = swipe_path(path)
+            print("✓" if ok else "✗ FAILED")
 
-            print("\n  Round done — grabbing next board...\n")
-            time.sleep(0.3)
+            # Wait for the tile-replacement animation to finish
+            time.sleep(BOARD_WAIT)
 
         except KeyboardInterrupt:
             print("\nBot stopped.")
