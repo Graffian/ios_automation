@@ -1,67 +1,93 @@
-import requests
-import time
+"""
+boggle_bot.py — Screenshot → Claude OCR → Solve → Swipe
+=========================================================
+Requires:
+    pip install requests pillow python-dotenv
+    .env file in the same folder containing:
+        ANTHROPIC_API_KEY=sk-ant-...
+    words.txt  (see load_dictionary for download command)
+"""
+
 import base64
-from PIL import Image
+import os
+import time
 from io import BytesIO
-import pytesseract
+from itertools import product as iterproduct
 
-# ─────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────
-WDA_URL   = "http://localhost:8100"
-HEADERS   = {"Content-Type": "application/json"}
+import requests
+from dotenv import load_dotenv
+from PIL import Image
 
-BOARD_WAIT = 2.2   # seconds between word swipes
+# Load variables from .env into os.environ before anything else
+load_dotenv()
 
-TILE_COORDS = {
-     0: (  84,  383),   # screen=(254,1151)  ÷ 3.0
-     1: ( 170,  388),   # screen=(511,1166)  ÷ 3.0
-     2: ( 256,  386),   # screen=(770,1160)  ÷ 3.0
-     3: ( 345,  383),   # screen=(1037,1151) ÷ 3.0
-     4: (  78,  473),   # screen=(235,1420)  ÷ 3.0
-     5: ( 171,  472),   # screen=(514,1417)  ÷ 3.0
-     6: ( 254,  467),   # screen=(762,1401)  ÷ 3.0
-     7: ( 357,  476),   # screen=(1072,1429) ÷ 3.0
-     8: (  81,  564),   # screen=(244,1693)  ÷ 3.0
-     9: ( 169,  562),   # screen=(508,1686)  ÷ 3.0
-    10: ( 262,  562),   # screen=(787,1686)  ÷ 3.0
-    11: ( 353,  554),   # screen=(1059,1664) ÷ 3.0
-    12: (  81,  652),   # screen=(244,1956)  ÷ 3.0
-    13: ( 173,  650),   # screen=(520,1950)  ÷ 3.0
-    14: ( 257,  646),   # screen=(771,1940)  ÷ 3.0
-    15: ( 358,  654),   # screen=(1075,1962) ÷ 3.0
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+WDA_URL = "http://localhost:8100"
+WDA_HEADERS = {"Content-Type": "application/json"}
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_HEADERS = {
+    "Content-Type": "application/json",
+    "x-api-key": ANTHROPIC_API_KEY,
+    "anthropic-version": "2023-06-01",
+}
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Tile centres in LOGICAL POINTS (screen coords ÷ COORD_SCALE)
+# Layout: 4×4 grid, index 0 = top-left, 15 = bottom-right
+TILE_COORDS: dict[int, tuple[int, int]] = {
+    0:  ( 84,  383),
+    1:  (170,  388),
+    2:  (256,  386),
+    3:  (345,  383),
+    4:  ( 78,  473),
+    5:  (171,  472),
+    6:  (254,  467),
+    7:  (357,  476),
+    8:  ( 81,  564),
+    9:  (169,  562),
+    10: (262,  562),
+    11: (353,  554),
+    12: ( 81,  652),
+    13: (173,  650),
+    14: (257,  646),
+    15: (358,  654),
 }
 
-COORD_SCALE = 3.0  # screenshot pixels per logical point
-PAD         = 80   # crop radius in screenshot pixels
-OCR_THRESH  = 140
-OCR_CONFIG  = "--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-NUDGE_STEP  = 3    # logical pts (≈8 screen px ÷ 3)
-NUDGE_RANGE = 16   # logical pts (≈48 screen px ÷ 3)
-VOTE_OFFSETS = [(-3,0),(3,0),(0,-3),(0,3),(-3,-3),(3,3),(-3,3),(3,-3),(0,0)]
+COORD_SCALE = 3.0   # screenshot pixels per logical point
 
-# ── Swipe timing ──
-HOLD_MS      = 350   # press-and-hold on tile 0 before dragging
-MOVE_MS      = 60    # ms per interpolated micro-step
-DWELL_MS     = 100   # pause on each tile centre
+# Swipe gesture timing (ms)
+HOLD_MS      = 350   # initial press-and-hold before dragging
+MOVE_MS      = 60    # duration per interpolation micro-step
+DWELL_MS     = 100   # pause at each tile centre
 INTERP_STEPS = 6     # waypoints injected between every two tiles
 
+BOARD_WAIT   = 2.2   # seconds to wait after each swipe (tile animation)
+WORDS_PATH   = "words.txt"
+MIN_WORD_LEN = 3
+MAX_WORD_LEN = 8
 
-# ─────────────────────────────────────────
-#  SESSION MANAGEMENT
-# ─────────────────────────────────────────
-_session_id = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WDA SESSION
+# ─────────────────────────────────────────────────────────────────────────────
+
+_session_id: str | None = None
 
 
-def _create_session():
-    r = requests.post(
+def _create_session() -> str:
+    resp = requests.post(
         f"{WDA_URL}/session",
         json={"capabilities": {"alwaysMatch": {}}},
-        headers=HEADERS,
+        headers=WDA_HEADERS,
         timeout=30,
     )
-    r.raise_for_status()
-    data = r.json()
+    resp.raise_for_status()
+    data = resp.json()
     sid = data.get("sessionId") or data.get("value", {}).get("sessionId")
     if not sid:
         raise RuntimeError(f"No sessionId in WDA response: {data}")
@@ -69,8 +95,10 @@ def _create_session():
     return sid
 
 
-def get_session():
+def get_session() -> str:
     global _session_id
+
+    # Validate existing session
     if _session_id:
         try:
             r = requests.get(f"{WDA_URL}/session/{_session_id}", timeout=5)
@@ -78,9 +106,10 @@ def get_session():
                 return _session_id
         except Exception:
             pass
-        print("  [WDA] Session expired — creating new one...")
+        print("  [WDA] Session expired — creating a new one...")
         _session_id = None
 
+    # Try to reuse a session already reported by WDA status
     try:
         r = requests.get(f"{WDA_URL}/status", timeout=8)
         sid = (
@@ -88,7 +117,7 @@ def get_session():
             or r.json().get("value", {}).get("sessionId")
         )
         if sid:
-            print(f"  [WDA] Reusing session: {sid}")
+            print(f"  [WDA] Reusing existing session: {sid}")
             _session_id = sid
             return _session_id
     except Exception:
@@ -98,16 +127,17 @@ def get_session():
     return _session_id
 
 
-# ─────────────────────────────────────────
-#  SCREENSHOT
-# ─────────────────────────────────────────
-def take_screenshot(retries=3):
+# ─────────────────────────────────────────────────────────────────────────────
+# SCREENSHOT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def take_screenshot(retries: int = 3) -> Image.Image:
+    global _session_id
     for attempt in range(retries):
         try:
             sid = get_session()
             r = requests.get(f"{WDA_URL}/session/{sid}/screenshot", timeout=15)
             if r.status_code == 404:
-                global _session_id
                 _session_id = None
                 continue
             r.raise_for_status()
@@ -115,176 +145,249 @@ def take_screenshot(retries=3):
             if isinstance(raw, dict):
                 raw = raw.get("value", "")
             return Image.open(BytesIO(base64.b64decode(raw)))
-        except Exception as e:
-            print(f"  [screenshot] attempt {attempt + 1} failed: {e}")
+        except Exception as exc:
+            print(f"  [screenshot] attempt {attempt + 1} failed: {exc}")
             time.sleep(1)
     raise RuntimeError("Screenshot failed after all retries.")
 
 
-# ─────────────────────────────────────────
-#  OCR
-# ─────────────────────────────────────────
-def _read_cell(img, cx, cy):
-    # cx/cy are logical points — scale up to screenshot pixels for cropping
-    px, py = int(cx * COORD_SCALE), int(cy * COORD_SCALE)
-    cell = img.crop((px - PAD, py - PAD, px + PAD, py + PAD)).convert("L")
-    cell_up = cell.resize((cell.width * 4, cell.height * 4), Image.LANCZOS)
-    cell_th = cell_up.point(lambda p: 0 if p < OCR_THRESH else 255)
-    raw = pytesseract.image_to_string(cell_th, config=OCR_CONFIG).strip()
-    return raw[0] if raw else ""
+# ─────────────────────────────────────────────────────────────────────────────
+# OCR  — Claude Vision
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Compute board bounding box from tile coords (screenshot pixels)
+_xs = [cx * COORD_SCALE for cx, _cy in TILE_COORDS.values()]
+_ys = [cy * COORD_SCALE for _cx, cy in TILE_COORDS.values()]
+BOARD_BOX = (
+    int(min(_xs)) - 120,
+    int(min(_ys)) - 120,
+    int(max(_xs)) + 120,
+    int(max(_ys)) + 120,
+)
 
 
-def _vote(img, cx, cy):
-    votes = {}
-    for dx, dy in VOTE_OFFSETS:
-        letter = _read_cell(img, cx + dx, cy + dy)
-        if letter:
-            votes[letter] = votes.get(letter, 0) + 1
-    return max(votes, key=votes.get) if votes else ""
+def _board_to_b64(img: Image.Image) -> str:
+    """Crop the board region and encode as base64 JPEG."""
+    crop = img.crop(BOARD_BOX)
+    buf = BytesIO()
+    crop.save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
-def ocr_tile(img, tile_idx):
-    base_cx, base_cy = TILE_COORDS[tile_idx]
-    letter = _vote(img, base_cx, base_cy)
-    if letter:
-        return letter
-    steps = range(-NUDGE_RANGE, NUDGE_RANGE + 1, NUDGE_STEP)
-    for dy in steps:
-        for dx in steps:
-            if dx == 0 and dy == 0:
-                continue
-            cx, cy = base_cx + dx, base_cy + dy
-            letter = _vote(img, cx, cy)
-            if letter:
-                print(f"    nudge tile {tile_idx}: ({dx:+d},{dy:+d}) -> '{letter}'")
-                TILE_COORDS[tile_idx] = (cx, cy)
-                return letter
-    return "?"
+def ocr_board(img: Image.Image) -> list[str]:
+    """
+    Send the board crop to Claude Vision.
+    Returns a list of exactly 16 lowercase letters, or ['?'] * 16 on failure.
+    """
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. "
+            "Export it with:  export ANTHROPIC_API_KEY='sk-ant-...'"
+        )
 
+    b64 = _board_to_b64(img)
 
-def ocr_board(img):
-    letters = [ocr_tile(img, i).lower() for i in range(16)]
-    board_str = "".join(l.upper() for l in letters)
-    print(f"  OCR: {board_str[:4]} {board_str[4:8]} {board_str[8:12]} {board_str[12:]}")
-    return letters
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 50,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a screenshot of a 4×4 Boggle word-game board. "
+                            "Read the 16 letter tiles LEFT TO RIGHT, TOP TO BOTTOM. "
+                            "Reply with ONLY the 16 uppercase letters as a single "
+                            "string — no spaces, no punctuation. "
+                            "Example: ABCDEFGHIJKLMNOP"
+                        ),
+                    },
+                ],
+            }
+        ],
+    }
 
-
-# ─────────────────────────────────────────
-#  DICTIONARY
-# ─────────────────────────────────────────
-def load_dictionary(path="words.txt"):
     try:
-        with open(path) as f:
-            words = {w.strip().lower() for w in f if 3 <= len(w.strip()) <= 8}
-        prefixes = set()
-        for w in words:
-            for i in range(1, len(w) + 1):
-                prefixes.add(w[:i])
-        print(f"  Loaded {len(words):,} words  ({len(prefixes):,} prefixes)")
-        return words, prefixes
+        r = requests.post(
+            ANTHROPIC_API_URL,
+            json=payload,
+            headers=ANTHROPIC_HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        raw = r.json()["content"][0]["text"].strip().upper()
+        letters_str = "".join(c for c in raw if c.isalpha())[:16]
+
+        if len(letters_str) != 16:
+            print(f"  [OCR] Unexpected response: '{raw}' — skipping frame")
+            return ["?"] * 16
+
+        letters = list(letters_str.lower())
+        print(
+            f"  OCR → {letters_str[:4]} {letters_str[4:8]} "
+            f"{letters_str[8:12]} {letters_str[12:]}"
+        )
+        return letters
+
+    except Exception as exc:
+        print(f"  [OCR] Claude Vision error: {exc}")
+        return ["?"] * 16
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DICTIONARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dictionary(path: str = WORDS_PATH) -> tuple[set[str], set[str]]:
+    """
+    Load a word-per-line dictionary.
+    Returns (words, prefixes) where prefixes enables DFS pruning.
+
+    Download with:
+        curl -o words.txt \\
+          https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt
+    """
+    try:
+        with open(path) as fh:
+            words = {
+                w.strip().lower()
+                for w in fh
+                if MIN_WORD_LEN <= len(w.strip()) <= MAX_WORD_LEN
+            }
     except FileNotFoundError:
-        print("  words.txt not found — run:")
-        print("  curl -o words.txt https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt")
+        print(f"  '{path}' not found. Download it with:")
+        print(
+            "  curl -o words.txt "
+            "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt"
+        )
         raise SystemExit(1)
 
+    prefixes: set[str] = set()
+    for word in words:
+        for i in range(1, len(word) + 1):
+            prefixes.add(word[:i])
 
-# ─────────────────────────────────────────
-#  SOLVER
-# ─────────────────────────────────────────
-def _build_neighbours():
-    nb = {}
+    print(f"  Dictionary: {len(words):,} words  /  {len(prefixes):,} prefixes")
+    return words, prefixes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_adjacency() -> dict[int, list[int]]:
+    """Pre-compute the 8-directional neighbours for each of the 16 tiles."""
+    adj: dict[int, list[int]] = {}
     for idx in range(16):
-        r, c = divmod(idx, 4)
-        nb[idx] = [
-            (r + dr) * 4 + (c + dc)
-            for dr in (-1, 0, 1)
-            for dc in (-1, 0, 1)
-            if (dr != 0 or dc != 0)
-            and 0 <= r + dr < 4
-            and 0 <= c + dc < 4
+        row, col = divmod(idx, 4)
+        adj[idx] = [
+            (row + dr) * 4 + (col + dc)
+            for dr, dc in iterproduct((-1, 0, 1), repeat=2)
+            if (dr, dc) != (0, 0)
+            and 0 <= row + dr < 4
+            and 0 <= col + dc < 4
         ]
-    return nb
-
-NEIGHBOURS = _build_neighbours()
+    return adj
 
 
-def solve_board(letters, words, prefixes):
-    found = {}
+ADJACENCY = _build_adjacency()
 
-    def dfs(idx, word, path, visited):
+
+def solve_board(
+    letters: list[str],
+    words: set[str],
+    prefixes: set[str],
+) -> dict[str, list[int]]:
+    """
+    DFS over the 4×4 board to find all valid words.
+    Returns {word: [tile_indices]} sorted longest-first.
+    """
+    found: dict[str, list[int]] = {}
+
+    def dfs(tile: int, word: str, path: list[int], visited: set[int]) -> None:
         if word not in prefixes:
             return
-        if len(word) >= 3 and word in words:
+        if len(word) >= MIN_WORD_LEN and word in words:
+            # Keep the path only if this is the first find (or longer path)
             if word not in found or len(path) > len(found[word]):
                 found[word] = list(path)
-        if len(word) == 8:
+        if len(word) == MAX_WORD_LEN:
             return
-        for nb in NEIGHBOURS[idx]:
-            if nb not in visited:
-                visited.add(nb)
-                path.append(nb)
-                dfs(nb, word + letters[nb], path, visited)
+        for neighbour in ADJACENCY[tile]:
+            if neighbour not in visited:
+                visited.add(neighbour)
+                path.append(neighbour)
+                dfs(neighbour, word + letters[neighbour], path, visited)
                 path.pop()
-                visited.remove(nb)
+                visited.remove(neighbour)
 
-    for i, ch in enumerate(letters):
-        if ch != "?":
-            dfs(i, ch, [i], {i})
+    for start, letter in enumerate(letters):
+        if letter != "?":
+            dfs(start, letter, [start], {start})
 
-    return dict(sorted(found.items(), key=lambda x: len(x[0]), reverse=True))
+    return dict(sorted(found.items(), key=lambda kv: len(kv[0]), reverse=True))
 
 
-# ─────────────────────────────────────────
-#  SWIPE  — W3C Actions with manual interpolation
+# ─────────────────────────────────────────────────────────────────────────────
+# SWIPE  — W3C Actions API with manual interpolation
 #
-#  Key fixes vs previous versions:
-#
-#  1. NO 'button' field in pointerDown/Up
-#     touch pointers don't have buttons; sending button:0 makes some WDA
-#     builds silently ignore the whole action sequence.
-#
-#  2. Manual waypoint interpolation (INTERP_STEPS micro-moves per tile pair)
-#     WDA does NOT move through intermediate screen positions when you only
-#     give start → end coords. The Boggle game detects tiles via hit-boxes,
-#     so we physically walk the finger through each tile ourselves.
-#
-#  3. DELETE /actions before each swipe
-#     Clears any stuck touch state left over from a previous crashed gesture.
-# ─────────────────────────────────────────
-def swipe_path(indices):
+# Design notes:
+#   • No 'button' field on pointerDown/Up — touch pointers have no buttons;
+#     including button:0 causes some WDA builds to silently drop the action.
+#   • Manual waypoint interpolation: WDA does NOT trace intermediate screen
+#     positions between start and end coords.  We walk the finger ourselves
+#     so the game's hit-boxes register every tile in the path.
+#   • DELETE /actions before each swipe to clear any stuck touch state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def swipe_path(indices: list[int]) -> bool:
+    """
+    Perform a continuous drag across the given tile indices.
+    Returns True on HTTP 200, False otherwise.
+    """
     sid = get_session()
 
-    # Clear stuck touch state
+    # Clear any leftover touch state from a previous gesture
     try:
         requests.delete(f"{WDA_URL}/session/{sid}/actions", timeout=5)
     except Exception:
         pass
 
-    sx, sy = TILE_COORDS[indices[0]]
-
-    acts = [
-        {"type": "pointerMove", "duration": 0, "x": int(sx), "y": int(sy)},
-        {"type": "pointerDown"},          # ← no 'button' field
+    start_x, start_y = TILE_COORDS[indices[0]]
+    actions = [
+        {"type": "pointerMove", "duration": 0, "x": start_x, "y": start_y},
+        {"type": "pointerDown"},
         {"type": "pause", "duration": HOLD_MS},
     ]
 
-    prev_x, prev_y = sx, sy
-    for idx in indices[1:]:
-        tx, ty = TILE_COORDS[idx]
+    prev_x, prev_y = start_x, start_y
+    for tile_idx in indices[1:]:
+        target_x, target_y = TILE_COORDS[tile_idx]
 
-        # Walk the finger through INTERP_STEPS positions so every
-        # tile's hit-box is crossed during the drag
+        # Inject INTERP_STEPS intermediate moves so every hit-box is crossed
         for step in range(1, INTERP_STEPS + 1):
             t = step / INTERP_STEPS
-            ix = int(prev_x + (tx - prev_x) * t)
-            iy = int(prev_y + (ty - prev_y) * t)
-            acts.append({"type": "pointerMove", "duration": MOVE_MS, "x": ix, "y": iy})
+            actions.append({
+                "type": "pointerMove",
+                "duration": MOVE_MS,
+                "x": int(prev_x + (target_x - prev_x) * t),
+                "y": int(prev_y + (target_y - prev_y) * t),
+            })
 
-        # Dwell on the tile centre
-        acts.append({"type": "pause", "duration": DWELL_MS})
-        prev_x, prev_y = tx, ty
+        actions.append({"type": "pause", "duration": DWELL_MS})
+        prev_x, prev_y = target_x, target_y
 
-    acts.append({"type": "pointerUp"})    # ← no 'button' field
+    actions.append({"type": "pointerUp"})
 
     payload = {
         "actions": [
@@ -292,7 +395,7 @@ def swipe_path(indices):
                 "type": "pointer",
                 "id": "finger1",
                 "parameters": {"pointerType": "touch"},
-                "actions": acts,
+                "actions": actions,
             }
         ]
     }
@@ -301,82 +404,91 @@ def swipe_path(indices):
         r = requests.post(
             f"{WDA_URL}/session/{sid}/actions",
             json=payload,
-            headers=HEADERS,
+            headers=WDA_HEADERS,
             timeout=20,
         )
         if r.status_code == 200:
             return True
-        print(f"    [swipe] {r.status_code}: {r.text[:300]}")
+        print(f"  [swipe] HTTP {r.status_code}: {r.text[:300]}")
         return False
-    except Exception as e:
-        print(f"    [swipe] exception: {e}")
+    except Exception as exc:
+        print(f"  [swipe] exception: {exc}")
         return False
 
 
-# ─────────────────────────────────────────
-#  MAIN LOOP
-# ─────────────────────────────────────────
-def run():
-    words, prefixes = load_dictionary("words.txt")
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("\n" + "=" * 54)
-    print("   Boggle Bot — Screenshot → OCR → Solve → Swipe")
-    print("=" * 54)
-    print("Ctrl+C to stop.\n")
+def run() -> None:
+    if not ANTHROPIC_API_KEY:
+        print("\n  ERROR: ANTHROPIC_API_KEY is not set.")
+        print("  Run:  export ANTHROPIC_API_KEY='sk-ant-...'")
+        raise SystemExit(1)
+
+    words, prefixes = load_dictionary(WORDS_PATH)
+
+    print()
+    print("=" * 56)
+    print("   Boggle Bot  —  Screenshot → OCR → Solve → Swipe")
+    print("=" * 56)
+    print("Press Ctrl+C to stop.\n")
 
     try:
         get_session()
-    except Exception as e:
-        print(f"  [WDA] Could not connect: {e}")
+    except Exception as exc:
+        print(f"  [WDA] Could not connect: {exc}")
         print("  Make sure WebDriverAgent is running on port 8100.\n")
 
-    played: set[str] = set()   # words already used on this board
-    last_letters: list = []
+    played: set[str] = set()
+    last_letters: list[str] = []
+    results: dict[str, list[int]] = {}
 
     while True:
         try:
-            # ── Screenshot + OCR ──────────────────────────────────────
+            # ── Screenshot + OCR ──────────────────────────────────────────
             img = take_screenshot()
             letters = ocr_board(img)
 
-            if letters.count("?") > 0:
-                print(f"  Unreadable tiles — retrying...")
+            if "?" in letters:
+                print("  Unreadable tiles — retrying...")
                 time.sleep(0.8)
                 continue
 
-            # ── If the board changed, reset played set ─────────────────
+            # ── Re-solve only when the board changes ──────────────────────
             if letters != last_letters:
                 played.clear()
                 last_letters = letters[:]
                 t0 = time.perf_counter()
                 results = solve_board(letters, words, prefixes)
                 elapsed = time.perf_counter() - t0
-                preview = ", ".join(w.upper() for w in list(results)[:6])
-                print(f"  {len(results)} words  ({elapsed:.3f}s)  Top: {preview}")
+                top_words = ", ".join(w.upper() for w in list(results)[:6])
+                print(
+                    f"  Board changed → {len(results)} words found "
+                    f"({elapsed:.3f}s)  |  Top: {top_words}"
+                )
 
-            # ── Pick best word not yet played ─────────────────────────
-            # Sort: longest first, then alphabetical as tiebreak
+            # ── Pick the best unplayed word ───────────────────────────────
             remaining = [(w, p) for w, p in results.items() if w not in played]
             if not remaining:
                 print("  All words played — waiting for new board...")
                 time.sleep(1.5)
                 continue
 
-            word, path = remaining[0]
+            word, path = remaining[0]   # already sorted longest-first
             played.add(word)
 
-            print(f"  ▶  {word.upper():<10}  tiles={path}", end="  ")
-            ok = swipe_path(path)
-            print("✓" if ok else "✗ FAILED")
+            print(f"  ▶  {word.upper():<12} tiles={path}", end="  ", flush=True)
+            success = swipe_path(path)
+            print("✓" if success else "✗ FAILED")
 
-            # Wait for the tile-replacement animation to finish
             time.sleep(BOARD_WAIT)
 
         except KeyboardInterrupt:
-            print("\nBot stopped.")
+            print("\n  Bot stopped.")
             break
-        except Exception as e:
-            print(f"  Error: {e}")
+        except Exception as exc:
+            print(f"  Unexpected error: {exc}")
             time.sleep(2)
 
 
