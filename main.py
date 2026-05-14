@@ -14,18 +14,31 @@ HEADERS   = {"Content-Type": "application/json"}
 BOARD_WAIT = 2.2   # seconds between word swipes
 
 TILE_COORDS = {
-    0:  ( 254, 1151),  1:  ( 511, 1166),  2:  ( 770, 1160),  3:  (1037, 1151),
-    4:  ( 235, 1420),  5:  ( 514, 1417),  6:  ( 762, 1401),  7:  (1072, 1429),
-    8:  ( 244, 1693),  9:  ( 508, 1686),  10: ( 787, 1686),  11: (1059, 1664),
-    12: ( 244, 1956),  13: ( 520, 1950),  14: ( 771, 1940),  15: (1075, 1962),
+     0: (  84,  383),   # screen=(254,1151)  ÷ 3.0
+     1: ( 170,  388),   # screen=(511,1166)  ÷ 3.0
+     2: ( 256,  386),   # screen=(770,1160)  ÷ 3.0
+     3: ( 345,  383),   # screen=(1037,1151) ÷ 3.0
+     4: (  78,  473),   # screen=(235,1420)  ÷ 3.0
+     5: ( 171,  472),   # screen=(514,1417)  ÷ 3.0
+     6: ( 254,  467),   # screen=(762,1401)  ÷ 3.0
+     7: ( 357,  476),   # screen=(1072,1429) ÷ 3.0
+     8: (  81,  564),   # screen=(244,1693)  ÷ 3.0
+     9: ( 169,  562),   # screen=(508,1686)  ÷ 3.0
+    10: ( 262,  562),   # screen=(787,1686)  ÷ 3.0
+    11: ( 353,  554),   # screen=(1059,1664) ÷ 3.0
+    12: (  81,  652),   # screen=(244,1956)  ÷ 3.0
+    13: ( 173,  650),   # screen=(520,1950)  ÷ 3.0
+    14: ( 257,  646),   # screen=(771,1940)  ÷ 3.0
+    15: ( 358,  654),   # screen=(1075,1962) ÷ 3.0
 }
 
-PAD         = 80
+COORD_SCALE = 3.0  # screenshot pixels per logical point
+PAD         = 80   # crop radius in screenshot pixels
 OCR_THRESH  = 140
 OCR_CONFIG  = "--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-NUDGE_STEP  = 8
-NUDGE_RANGE = 48
-VOTE_OFFSETS = [(-10,0),(10,0),(0,-10),(0,10),(-10,-10),(10,10),(-10,10),(10,-10),(0,0)]
+NUDGE_STEP  = 3    # logical pts (≈8 screen px ÷ 3)
+NUDGE_RANGE = 16   # logical pts (≈48 screen px ÷ 3)
+VOTE_OFFSETS = [(-3,0),(3,0),(0,-3),(0,3),(-3,-3),(3,3),(-3,3),(3,-3),(0,0)]
 
 # ── Swipe timing ──
 HOLD_MS      = 350   # press-and-hold on tile 0 before dragging
@@ -112,7 +125,9 @@ def take_screenshot(retries=3):
 #  OCR
 # ─────────────────────────────────────────
 def _read_cell(img, cx, cy):
-    cell = img.crop((cx - PAD, cy - PAD, cx + PAD, cy + PAD)).convert("L")
+    # cx/cy are logical points — scale up to screenshot pixels for cropping
+    px, py = int(cx * COORD_SCALE), int(cy * COORD_SCALE)
+    cell = img.crop((px - PAD, py - PAD, px + PAD, py + PAD)).convert("L")
     cell_up = cell.resize((cell.width * 4, cell.height * 4), Image.LANCZOS)
     cell_th = cell_up.point(lambda p: 0 if p < OCR_THRESH else 255)
     raw = pytesseract.image_to_string(cell_th, config=OCR_CONFIG).strip()
