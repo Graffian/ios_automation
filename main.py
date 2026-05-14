@@ -3,9 +3,9 @@ boggle_bot.py — Screenshot → Claude OCR → Solve → Swipe
 =========================================================
 Requires:
     pip install requests pillow python-dotenv
-    .env file in the same folder containing:
+    .env file in the same folder:
         ANTHROPIC_API_KEY=sk-ant-...
-    words.txt  (see load_dictionary for download command)
+    words.txt (see load_dictionary for download command)
 """
 
 import base64
@@ -18,27 +18,21 @@ import requests
 from dotenv import load_dotenv
 from PIL import Image
 
-# Load variables from .env into os.environ before anything else
+# Load .env FIRST — before any os.environ reads
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-WDA_URL = "http://localhost:8100"
+WDA_URL     = "http://localhost:8100"
 WDA_HEADERS = {"Content-Type": "application/json"}
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_HEADERS = {
-    "Content-Type": "application/json",
-    "x-api-key": ANTHROPIC_API_KEY,
-    "anthropic-version": "2023-06-01",
-}
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL      = "claude-sonnet-4-20250514"
+# API key is read inside ocr_board() at call time (not at import time)
+# so load_dotenv() above has already populated os.environ by then.
 
-# Tile centres in LOGICAL POINTS (screen coords ÷ COORD_SCALE)
-# Layout: 4×4 grid, index 0 = top-left, 15 = bottom-right
 TILE_COORDS: dict[int, tuple[int, int]] = {
     0:  ( 84,  383),
     1:  (170,  388),
@@ -58,15 +52,12 @@ TILE_COORDS: dict[int, tuple[int, int]] = {
     15: (358,  654),
 }
 
-COORD_SCALE = 3.0   # screenshot pixels per logical point
-
-# Swipe gesture timing (ms)
-HOLD_MS      = 350   # initial press-and-hold before dragging
-MOVE_MS      = 60    # duration per interpolation micro-step
-DWELL_MS     = 100   # pause at each tile centre
-INTERP_STEPS = 6     # waypoints injected between every two tiles
-
-BOARD_WAIT   = 2.2   # seconds to wait after each swipe (tile animation)
+COORD_SCALE  = 3.0
+HOLD_MS      = 350
+MOVE_MS      = 60
+DWELL_MS     = 100
+INTERP_STEPS = 6
+BOARD_WAIT   = 2.2
 WORDS_PATH   = "words.txt"
 MIN_WORD_LEN = 3
 MAX_WORD_LEN = 8
@@ -98,7 +89,6 @@ def _create_session() -> str:
 def get_session() -> str:
     global _session_id
 
-    # Validate existing session
     if _session_id:
         try:
             r = requests.get(f"{WDA_URL}/session/{_session_id}", timeout=5)
@@ -109,7 +99,6 @@ def get_session() -> str:
         print("  [WDA] Session expired — creating a new one...")
         _session_id = None
 
-    # Try to reuse a session already reported by WDA status
     try:
         r = requests.get(f"{WDA_URL}/status", timeout=8)
         sid = (
@@ -155,7 +144,6 @@ def take_screenshot(retries: int = 3) -> Image.Image:
 # OCR  — Claude Vision
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Compute board bounding box from tile coords (screenshot pixels)
 _xs = [cx * COORD_SCALE for cx, _cy in TILE_COORDS.values()]
 _ys = [cy * COORD_SCALE for _cx, cy in TILE_COORDS.values()]
 BOARD_BOX = (
@@ -167,7 +155,6 @@ BOARD_BOX = (
 
 
 def _board_to_b64(img: Image.Image) -> str:
-    """Crop the board region and encode as base64 JPEG."""
     crop = img.crop(BOARD_BOX)
     buf = BytesIO()
     crop.save(buf, format="JPEG", quality=92)
@@ -176,16 +163,23 @@ def _board_to_b64(img: Image.Image) -> str:
 
 def ocr_board(img: Image.Image) -> list[str]:
     """
-    Send the board crop to Claude Vision.
-    Returns a list of exactly 16 lowercase letters, or ['?'] * 16 on failure.
+    Send board crop to Claude Vision.
+    Returns list of 16 lowercase letters, or ['?']*16 on failure.
     """
-    if not ANTHROPIC_API_KEY:
+    # Read key HERE at call time — load_dotenv() has already run by now
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. "
-            "Export it with:  export ANTHROPIC_API_KEY='sk-ant-...'"
+            "ANTHROPIC_API_KEY not found.\n"
+            "Make sure your .env file exists in the same folder and contains:\n"
+            "  ANTHROPIC_API_KEY=sk-ant-..."
         )
 
-    b64 = _board_to_b64(img)
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
 
     payload = {
         "model": CLAUDE_MODEL,
@@ -199,16 +193,16 @@ def ocr_board(img: Image.Image) -> list[str]:
                         "source": {
                             "type": "base64",
                             "media_type": "image/jpeg",
-                            "data": b64,
+                            "data": _board_to_b64(img),
                         },
                     },
                     {
                         "type": "text",
                         "text": (
-                            "This is a screenshot of a 4×4 Boggle word-game board. "
+                            "This is a screenshot of a 4x4 Boggle word-game board. "
                             "Read the 16 letter tiles LEFT TO RIGHT, TOP TO BOTTOM. "
                             "Reply with ONLY the 16 uppercase letters as a single "
-                            "string — no spaces, no punctuation. "
+                            "string, no spaces, no punctuation. "
                             "Example: ABCDEFGHIJKLMNOP"
                         ),
                     },
@@ -221,7 +215,7 @@ def ocr_board(img: Image.Image) -> list[str]:
         r = requests.post(
             ANTHROPIC_API_URL,
             json=payload,
-            headers=ANTHROPIC_HEADERS,
+            headers=headers,
             timeout=20,
         )
         r.raise_for_status()
@@ -232,12 +226,11 @@ def ocr_board(img: Image.Image) -> list[str]:
             print(f"  [OCR] Unexpected response: '{raw}' — skipping frame")
             return ["?"] * 16
 
-        letters = list(letters_str.lower())
         print(
-            f"  OCR → {letters_str[:4]} {letters_str[4:8]} "
+            f"  OCR -> {letters_str[:4]} {letters_str[4:8]} "
             f"{letters_str[8:12]} {letters_str[12:]}"
         )
-        return letters
+        return list(letters_str.lower())
 
     except Exception as exc:
         print(f"  [OCR] Claude Vision error: {exc}")
@@ -250,12 +243,10 @@ def ocr_board(img: Image.Image) -> list[str]:
 
 def load_dictionary(path: str = WORDS_PATH) -> tuple[set[str], set[str]]:
     """
-    Load a word-per-line dictionary.
-    Returns (words, prefixes) where prefixes enables DFS pruning.
+    Load word list and build prefix set for DFS pruning.
 
-    Download with:
-        curl -o words.txt \\
-          https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt
+    Download words.txt:
+        curl -o words.txt https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt
     """
     try:
         with open(path) as fh:
@@ -286,7 +277,6 @@ def load_dictionary(path: str = WORDS_PATH) -> tuple[set[str], set[str]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_adjacency() -> dict[int, list[int]]:
-    """Pre-compute the 8-directional neighbours for each of the 16 tiles."""
     adj: dict[int, list[int]] = {}
     for idx in range(16):
         row, col = divmod(idx, 4)
@@ -308,28 +298,24 @@ def solve_board(
     words: set[str],
     prefixes: set[str],
 ) -> dict[str, list[int]]:
-    """
-    DFS over the 4×4 board to find all valid words.
-    Returns {word: [tile_indices]} sorted longest-first.
-    """
+    """DFS solver. Returns {word: path} sorted longest-first."""
     found: dict[str, list[int]] = {}
 
     def dfs(tile: int, word: str, path: list[int], visited: set[int]) -> None:
         if word not in prefixes:
             return
         if len(word) >= MIN_WORD_LEN and word in words:
-            # Keep the path only if this is the first find (or longer path)
             if word not in found or len(path) > len(found[word]):
                 found[word] = list(path)
         if len(word) == MAX_WORD_LEN:
             return
-        for neighbour in ADJACENCY[tile]:
-            if neighbour not in visited:
-                visited.add(neighbour)
-                path.append(neighbour)
-                dfs(neighbour, word + letters[neighbour], path, visited)
+        for nb in ADJACENCY[tile]:
+            if nb not in visited:
+                visited.add(nb)
+                path.append(nb)
+                dfs(nb, word + letters[nb], path, visited)
                 path.pop()
-                visited.remove(neighbour)
+                visited.remove(nb)
 
     for start, letter in enumerate(letters):
         if letter != "?":
@@ -340,24 +326,11 @@ def solve_board(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SWIPE  — W3C Actions API with manual interpolation
-#
-# Design notes:
-#   • No 'button' field on pointerDown/Up — touch pointers have no buttons;
-#     including button:0 causes some WDA builds to silently drop the action.
-#   • Manual waypoint interpolation: WDA does NOT trace intermediate screen
-#     positions between start and end coords.  We walk the finger ourselves
-#     so the game's hit-boxes register every tile in the path.
-#   • DELETE /actions before each swipe to clear any stuck touch state.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def swipe_path(indices: list[int]) -> bool:
-    """
-    Perform a continuous drag across the given tile indices.
-    Returns True on HTTP 200, False otherwise.
-    """
     sid = get_session()
 
-    # Clear any leftover touch state from a previous gesture
     try:
         requests.delete(f"{WDA_URL}/session/{sid}/actions", timeout=5)
     except Exception:
@@ -372,32 +345,27 @@ def swipe_path(indices: list[int]) -> bool:
 
     prev_x, prev_y = start_x, start_y
     for tile_idx in indices[1:]:
-        target_x, target_y = TILE_COORDS[tile_idx]
-
-        # Inject INTERP_STEPS intermediate moves so every hit-box is crossed
+        tx, ty = TILE_COORDS[tile_idx]
         for step in range(1, INTERP_STEPS + 1):
             t = step / INTERP_STEPS
             actions.append({
                 "type": "pointerMove",
                 "duration": MOVE_MS,
-                "x": int(prev_x + (target_x - prev_x) * t),
-                "y": int(prev_y + (target_y - prev_y) * t),
+                "x": int(prev_x + (tx - prev_x) * t),
+                "y": int(prev_y + (ty - prev_y) * t),
             })
-
         actions.append({"type": "pause", "duration": DWELL_MS})
-        prev_x, prev_y = target_x, target_y
+        prev_x, prev_y = tx, ty
 
     actions.append({"type": "pointerUp"})
 
     payload = {
-        "actions": [
-            {
-                "type": "pointer",
-                "id": "finger1",
-                "parameters": {"pointerType": "touch"},
-                "actions": actions,
-            }
-        ]
+        "actions": [{
+            "type": "pointer",
+            "id": "finger1",
+            "parameters": {"pointerType": "touch"},
+            "actions": actions,
+        }]
     }
 
     try:
@@ -421,16 +389,17 @@ def swipe_path(indices: list[int]) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run() -> None:
-    if not ANTHROPIC_API_KEY:
-        print("\n  ERROR: ANTHROPIC_API_KEY is not set.")
-        print("  Run:  export ANTHROPIC_API_KEY='sk-ant-...'")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("\n  ERROR: ANTHROPIC_API_KEY not found in environment or .env file.")
+        print("  Make sure .env exists in this folder and contains:")
+        print("    ANTHROPIC_API_KEY=sk-ant-...")
         raise SystemExit(1)
 
     words, prefixes = load_dictionary(WORDS_PATH)
 
     print()
     print("=" * 56)
-    print("   Boggle Bot  —  Screenshot → OCR → Solve → Swipe")
+    print("   Boggle Bot  --  Screenshot -> OCR -> Solve -> Swipe")
     print("=" * 56)
     print("Press Ctrl+C to stop.\n")
 
@@ -446,8 +415,7 @@ def run() -> None:
 
     while True:
         try:
-            # ── Screenshot + OCR ──────────────────────────────────────────
-            img = take_screenshot()
+            img     = take_screenshot()
             letters = ocr_board(img)
 
             if "?" in letters:
@@ -455,32 +423,26 @@ def run() -> None:
                 time.sleep(0.8)
                 continue
 
-            # ── Re-solve only when the board changes ──────────────────────
             if letters != last_letters:
                 played.clear()
                 last_letters = letters[:]
-                t0 = time.perf_counter()
+                t0      = time.perf_counter()
                 results = solve_board(letters, words, prefixes)
                 elapsed = time.perf_counter() - t0
-                top_words = ", ".join(w.upper() for w in list(results)[:6])
-                print(
-                    f"  Board changed → {len(results)} words found "
-                    f"({elapsed:.3f}s)  |  Top: {top_words}"
-                )
+                top     = ", ".join(w.upper() for w in list(results)[:6])
+                print(f"  Board changed -> {len(results)} words ({elapsed:.3f}s)  |  Top: {top}")
 
-            # ── Pick the best unplayed word ───────────────────────────────
             remaining = [(w, p) for w, p in results.items() if w not in played]
             if not remaining:
                 print("  All words played — waiting for new board...")
                 time.sleep(1.5)
                 continue
 
-            word, path = remaining[0]   # already sorted longest-first
+            word, path = remaining[0]
             played.add(word)
 
-            print(f"  ▶  {word.upper():<12} tiles={path}", end="  ", flush=True)
-            success = swipe_path(path)
-            print("✓" if success else "✗ FAILED")
+            print(f"  >  {word.upper():<12} tiles={path}", end="  ", flush=True)
+            print("OK" if swipe_path(path) else "FAILED")
 
             time.sleep(BOARD_WAIT)
 
