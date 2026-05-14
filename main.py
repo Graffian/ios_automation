@@ -11,7 +11,7 @@ import pytesseract
 WDA_URL   = "http://localhost:8100"
 HEADERS   = {"Content-Type": "application/json"}
 
-BOARD_WAIT = 2.0   # seconds between word swipes (give UI time to settle)
+BOARD_WAIT = 2.2   # seconds between word swipes
 
 TILE_COORDS = {
     0:  ( 254, 1151),  1:  ( 511, 1166),  2:  ( 770, 1160),  3:  (1037, 1151),
@@ -27,20 +27,20 @@ NUDGE_STEP  = 8
 NUDGE_RANGE = 48
 VOTE_OFFSETS = [(-10,0),(10,0),(0,-10),(0,10),(-10,-10),(10,10),(-10,10),(10,-10),(0,0)]
 
-# Swipe timing
-HOLD_MS     = 300   # hold on first tile before dragging
-MOVE_MS     = 200   # time to slide between each tile
-DWELL_MS    = 80    # pause ON each tile so it registers
+# ── Swipe timing ──
+HOLD_MS      = 350   # press-and-hold on tile 0 before dragging
+MOVE_MS      = 60    # ms per interpolated micro-step
+DWELL_MS     = 100   # pause on each tile centre
+INTERP_STEPS = 6     # waypoints injected between every two tiles
 
 
 # ─────────────────────────────────────────
-#  SESSION MANAGEMENT  (auto-create / recover)
+#  SESSION MANAGEMENT
 # ─────────────────────────────────────────
-_session_id: str | None = None
+_session_id = None
 
 
-def _create_session() -> str:
-    """Ask WDA to create a new session and return its ID."""
+def _create_session():
     r = requests.post(
         f"{WDA_URL}/session",
         json={"capabilities": {"alwaysMatch": {}}},
@@ -49,7 +49,6 @@ def _create_session() -> str:
     )
     r.raise_for_status()
     data = r.json()
-    # WDA wraps the response in {"value": {"sessionId": ...}}
     sid = data.get("sessionId") or data.get("value", {}).get("sessionId")
     if not sid:
         raise RuntimeError(f"No sessionId in WDA response: {data}")
@@ -57,8 +56,7 @@ def _create_session() -> str:
     return sid
 
 
-def get_session() -> str:
-    """Return a live session ID, (re-)creating one if needed."""
+def get_session():
     global _session_id
     if _session_id:
         try:
@@ -67,19 +65,17 @@ def get_session() -> str:
                 return _session_id
         except Exception:
             pass
-        print("  [WDA] Session dead — creating new one...")
+        print("  [WDA] Session expired — creating new one...")
         _session_id = None
 
-    # Check if WDA already has an active session via /status
     try:
         r = requests.get(f"{WDA_URL}/status", timeout=8)
-        status = r.json()
         sid = (
-            status.get("sessionId")
-            or status.get("value", {}).get("sessionId")
+            r.json().get("sessionId")
+            or r.json().get("value", {}).get("sessionId")
         )
         if sid:
-            print(f"  [WDA] Reusing existing session: {sid}")
+            print(f"  [WDA] Reusing session: {sid}")
             _session_id = sid
             return _session_id
     except Exception:
@@ -90,30 +86,24 @@ def get_session() -> str:
 
 
 # ─────────────────────────────────────────
-#  SCREENSHOT  (with retry + session recovery)
+#  SCREENSHOT
 # ─────────────────────────────────────────
-def take_screenshot(retries: int = 3) -> Image.Image:
+def take_screenshot(retries=3):
     for attempt in range(retries):
         try:
             sid = get_session()
-            r = requests.get(
-                f"{WDA_URL}/session/{sid}/screenshot",
-                timeout=15,
-            )
+            r = requests.get(f"{WDA_URL}/session/{sid}/screenshot", timeout=15)
             if r.status_code == 404:
-                # Session vanished mid-flight
                 global _session_id
                 _session_id = None
                 continue
             r.raise_for_status()
-            raw = r.json().get("value") or r.json().get("value", {})
-            # WDA returns either {"value": "<base64>"} or nested
+            raw = r.json().get("value", "")
             if isinstance(raw, dict):
                 raw = raw.get("value", "")
-            img = Image.open(BytesIO(base64.b64decode(raw)))
-            return img
+            return Image.open(BytesIO(base64.b64decode(raw)))
         except Exception as e:
-            print(f"  [screenshot] attempt {attempt+1} failed: {e}")
+            print(f"  [screenshot] attempt {attempt + 1} failed: {e}")
             time.sleep(1)
     raise RuntimeError("Screenshot failed after all retries.")
 
@@ -121,7 +111,7 @@ def take_screenshot(retries: int = 3) -> Image.Image:
 # ─────────────────────────────────────────
 #  OCR
 # ─────────────────────────────────────────
-def _read_cell(img: Image.Image, cx: int, cy: int) -> str:
+def _read_cell(img, cx, cy):
     cell = img.crop((cx - PAD, cy - PAD, cx + PAD, cy + PAD)).convert("L")
     cell_up = cell.resize((cell.width * 4, cell.height * 4), Image.LANCZOS)
     cell_th = cell_up.point(lambda p: 0 if p < OCR_THRESH else 255)
@@ -129,8 +119,8 @@ def _read_cell(img: Image.Image, cx: int, cy: int) -> str:
     return raw[0] if raw else ""
 
 
-def _vote(img: Image.Image, cx: int, cy: int) -> str:
-    votes: dict[str, int] = {}
+def _vote(img, cx, cy):
+    votes = {}
     for dx, dy in VOTE_OFFSETS:
         letter = _read_cell(img, cx + dx, cy + dy)
         if letter:
@@ -138,7 +128,7 @@ def _vote(img: Image.Image, cx: int, cy: int) -> str:
     return max(votes, key=votes.get) if votes else ""
 
 
-def ocr_tile(img: Image.Image, tile_idx: int) -> str:
+def ocr_tile(img, tile_idx):
     base_cx, base_cy = TILE_COORDS[tile_idx]
     letter = _vote(img, base_cx, base_cy)
     if letter:
@@ -157,7 +147,7 @@ def ocr_tile(img: Image.Image, tile_idx: int) -> str:
     return "?"
 
 
-def ocr_board(img: Image.Image) -> list[str]:
+def ocr_board(img):
     letters = [ocr_tile(img, i).lower() for i in range(16)]
     board_str = "".join(l.upper() for l in letters)
     print(f"  OCR: {board_str[:4]} {board_str[4:8]} {board_str[8:12]} {board_str[12:]}")
@@ -167,11 +157,11 @@ def ocr_board(img: Image.Image) -> list[str]:
 # ─────────────────────────────────────────
 #  DICTIONARY
 # ─────────────────────────────────────────
-def load_dictionary(path: str = "words.txt"):
+def load_dictionary(path="words.txt"):
     try:
         with open(path) as f:
             words = {w.strip().lower() for w in f if 3 <= len(w.strip()) <= 8}
-        prefixes: set[str] = set()
+        prefixes = set()
         for w in words:
             for i in range(1, len(w) + 1):
                 prefixes.add(w[:i])
@@ -186,8 +176,8 @@ def load_dictionary(path: str = "words.txt"):
 # ─────────────────────────────────────────
 #  SOLVER
 # ─────────────────────────────────────────
-def _build_neighbours() -> dict[int, list[int]]:
-    nb: dict[int, list[int]] = {}
+def _build_neighbours():
+    nb = {}
     for idx in range(16):
         r, c = divmod(idx, 4)
         nb[idx] = [
@@ -203,10 +193,10 @@ def _build_neighbours() -> dict[int, list[int]]:
 NEIGHBOURS = _build_neighbours()
 
 
-def solve_board(letters: list[str], words: set, prefixes: set) -> dict:
-    found: dict[str, list[int]] = {}
+def solve_board(letters, words, prefixes):
+    found = {}
 
-    def dfs(idx: int, word: str, path: list[int], visited: set[int]):
+    def dfs(idx, word, path, visited):
         if word not in prefixes:
             return
         if len(word) >= 3 and word in words:
@@ -230,92 +220,82 @@ def solve_board(letters: list[str], words: set, prefixes: set) -> dict:
 
 
 # ─────────────────────────────────────────
-#  SWIPE  — JSONWP touch/perform (most reliable for WDA game gestures)
+#  SWIPE  — W3C Actions with manual interpolation
 #
-#  This uses the legacy JSONWP TouchAction API which WDA still supports
-#  and which works far better than W3C actions for continuous drag gestures.
+#  Key fixes vs previous versions:
 #
-#  Gesture shape:
-#    press (hold HOLD_MS) → moveTo tile2 (MOVE_MS) → wait DWELL_MS
-#                         → moveTo tile3 (MOVE_MS) → wait DWELL_MS ...
-#                         → release
+#  1. NO 'button' field in pointerDown/Up
+#     touch pointers don't have buttons; sending button:0 makes some WDA
+#     builds silently ignore the whole action sequence.
+#
+#  2. Manual waypoint interpolation (INTERP_STEPS micro-moves per tile pair)
+#     WDA does NOT move through intermediate screen positions when you only
+#     give start → end coords. The Boggle game detects tiles via hit-boxes,
+#     so we physically walk the finger through each tile ourselves.
+#
+#  3. DELETE /actions before each swipe
+#     Clears any stuck touch state left over from a previous crashed gesture.
 # ─────────────────────────────────────────
-def _swipe_jsonwp(indices: list[int]) -> bool:
+def swipe_path(indices):
     sid = get_session()
-    url = f"{WDA_URL}/session/{sid}/touch/perform"
 
-    sx, sy = TILE_COORDS[indices[0]]
-
-    actions = [
-        # Press and hold on first tile — this is the key gesture the game needs
-        {"action": "press",  "options": {"x": sx, "y": sy}},
-        {"action": "wait",   "options": {"ms": HOLD_MS}},
-    ]
-
-    for idx in indices[1:]:
-        tx, ty = TILE_COORDS[idx]
-        actions.append({"action": "moveTo", "options": {"x": tx, "y": ty, "duration": MOVE_MS}})
-        actions.append({"action": "wait",   "options": {"ms": DWELL_MS}})
-
-    actions.append({"action": "release"})
-
+    # Clear stuck touch state
     try:
-        r = requests.post(url, json={"actions": actions}, headers=HEADERS, timeout=20)
-        if r.status_code == 200:
-            return True
-        print(f"    [JSONWP swipe] {r.status_code}: {r.text[:200]}")
-        return False
-    except Exception as e:
-        print(f"    [JSONWP swipe] exception: {e}")
-        return False
-
-
-def _swipe_w3c(indices: list[int]) -> bool:
-    """
-    W3C Actions fallback — used only if JSONWP fails.
-    NOTE: do NOT pass 'origin' — it breaks on many WDA versions.
-    """
-    sid = get_session()
-    url = f"{WDA_URL}/session/{sid}/actions"
+        requests.delete(f"{WDA_URL}/session/{sid}/actions", timeout=5)
+    except Exception:
+        pass
 
     sx, sy = TILE_COORDS[indices[0]]
 
     acts = [
-        {"type": "pointerMove", "duration": 0, "x": sx, "y": sy},
-        {"type": "pointerDown", "button": 0},
-        {"type": "pause",       "duration": HOLD_MS},
+        {"type": "pointerMove", "duration": 0, "x": int(sx), "y": int(sy)},
+        {"type": "pointerDown"},          # ← no 'button' field
+        {"type": "pause", "duration": HOLD_MS},
     ]
+
+    prev_x, prev_y = sx, sy
     for idx in indices[1:]:
         tx, ty = TILE_COORDS[idx]
-        acts.append({"type": "pointerMove", "duration": MOVE_MS, "x": tx, "y": ty})
-        acts.append({"type": "pause",       "duration": DWELL_MS})
-    acts.append({"type": "pointerUp", "button": 0})
+
+        # Walk the finger through INTERP_STEPS positions so every
+        # tile's hit-box is crossed during the drag
+        for step in range(1, INTERP_STEPS + 1):
+            t = step / INTERP_STEPS
+            ix = int(prev_x + (tx - prev_x) * t)
+            iy = int(prev_y + (ty - prev_y) * t)
+            acts.append({"type": "pointerMove", "duration": MOVE_MS, "x": ix, "y": iy})
+
+        # Dwell on the tile centre
+        acts.append({"type": "pause", "duration": DWELL_MS})
+        prev_x, prev_y = tx, ty
+
+    acts.append({"type": "pointerUp"})    # ← no 'button' field
 
     payload = {
-        "actions": [{
-            "type": "pointer",
-            "id": "finger1",
-            "parameters": {"pointerType": "touch"},
-            "actions": acts,
-        }]
+        "actions": [
+            {
+                "type": "pointer",
+                "id": "finger1",
+                "parameters": {"pointerType": "touch"},
+                "actions": acts,
+            }
+        ]
     }
+
     try:
-        r = requests.post(url, json=payload, headers=HEADERS, timeout=20)
+        r = requests.post(
+            f"{WDA_URL}/session/{sid}/actions",
+            json=payload,
+            headers=HEADERS,
+            timeout=20,
+        )
         if r.status_code == 200:
             return True
-        print(f"    [W3C swipe] {r.status_code}: {r.text[:200]}")
+        print(f"    [swipe] {r.status_code}: {r.text[:300]}")
         return False
     except Exception as e:
-        print(f"    [W3C swipe] exception: {e}")
+        print(f"    [swipe] exception: {e}")
         return False
-
-
-def swipe_path(indices: list[int]) -> bool:
-    """Try JSONWP first (best for games), fall back to W3C."""
-    if _swipe_jsonwp(indices):
-        return True
-    print("    JSONWP failed — trying W3C fallback...")
-    return _swipe_w3c(indices)
 
 
 # ─────────────────────────────────────────
@@ -329,7 +309,6 @@ def run():
     print("=" * 54)
     print("Ctrl+C to stop.\n")
 
-    # Warm up session early so first screenshot doesn't fail
     try:
         get_session()
     except Exception as e:
@@ -338,11 +317,9 @@ def run():
 
     while True:
         try:
-            # ── 1. Screenshot ──────────────────────────
             print("Taking screenshot...")
             img = take_screenshot()
 
-            # ── 2. OCR ────────────────────────────────
             letters = ocr_board(img)
             bad = letters.count("?")
             if bad:
@@ -350,7 +327,6 @@ def run():
                 time.sleep(1)
                 continue
 
-            # ── 3. Solve ──────────────────────────────
             t0 = time.perf_counter()
             results = solve_board(letters, words, prefixes)
             elapsed = time.perf_counter() - t0
@@ -365,12 +341,10 @@ def run():
             preview = ", ".join(w.upper() for w, _ in top[:8])
             print(f"  Top: {preview}{'...' if len(top) > 8 else ''}\n")
 
-            # ── 4. Swipe each word ────────────────────
             for word, path in top:
                 print(f"  ▶  {word.upper():<10}  tiles={path}", end="  ")
                 ok = swipe_path(path)
-                status = "✓" if ok else "✗ FAILED"
-                print(status)
+                print("✓" if ok else "✗ SWIPE FAILED")
                 time.sleep(BOARD_WAIT)
 
             print("\n  Round done — grabbing next board...\n")
