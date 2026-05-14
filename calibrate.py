@@ -1,43 +1,31 @@
 """
-calibrate.py  —  Run this ONCE before the bot.
-
-It does two things:
-  1. Takes a screenshot and draws numbered circles on every TILE_COORDS position
-     → saves  calibration_check.png  (open this to see if the dots land on the tiles)
-
-  2. Runs a TAP TEST: taps each tile index 0-15 one at a time, 1 second apart
-     → watch your phone — each tile should briefly glow in order
-
-If the dots / glows are in the wrong place, edit the TILE_COORDS in boggle_bot.py
-to match your screen.
+calibrate.py  —  detects coordinate scale and finds correct tile positions.
+Run with the Boggle game open on your phone.
 """
-
 import requests
 import base64
 import time
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from io import BytesIO
 
-# ── paste your WDA URL and session here ──────────────────────────────────────
-WDA_URL   = "http://localhost:8100"
-HEADERS   = {"Content-Type": "application/json"}
+WDA_URL = "http://localhost:8100"
+HEADERS = {"Content-Type": "application/json"}
 
-TILE_COORDS = {
+# Current coords (screenshot pixel space — confirmed correct visually)
+TILE_COORDS_SCREEN = {
     0:  ( 254, 1151),  1:  ( 511, 1166),  2:  ( 770, 1160),  3:  (1037, 1151),
     4:  ( 235, 1420),  5:  ( 514, 1417),  6:  ( 762, 1401),  7:  (1072, 1429),
     8:  ( 244, 1693),  9:  ( 508, 1686),  10: ( 787, 1686),  11: (1059, 1664),
     12: ( 244, 1956),  13: ( 520, 1950),  14: ( 771, 1940),  15: (1075, 1962),
 }
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def get_session():
-    """Get or create a WDA session."""
     try:
         r = requests.get(f"{WDA_URL}/status", timeout=8)
-        sid = r.json().get("sessionId") or r.json().get("value", {}).get("sessionId")
+        data = r.json()
+        sid = data.get("sessionId") or data.get("value", {}).get("sessionId")
         if sid:
-            print(f"  Using existing session: {sid}")
             return sid
     except Exception:
         pass
@@ -48,9 +36,14 @@ def get_session():
     )
     r.raise_for_status()
     data = r.json()
-    sid = data.get("sessionId") or data.get("value", {}).get("sessionId")
-    print(f"  Created new session: {sid}")
-    return sid
+    return data.get("sessionId") or data.get("value", {}).get("sessionId")
+
+
+def get_window_size(sid):
+    """Get logical screen size from WDA — this is the touch coordinate space."""
+    r = requests.get(f"{WDA_URL}/session/{sid}/window/size", timeout=10)
+    data = r.json().get("value", {})
+    return int(data.get("width", 0)), int(data.get("height", 0))
 
 
 def take_screenshot(sid):
@@ -59,11 +52,12 @@ def take_screenshot(sid):
     raw = r.json().get("value", "")
     if isinstance(raw, dict):
         raw = raw.get("value", "")
-    return Image.open(BytesIO(base64.b64decode(raw)))
+    img = Image.open(BytesIO(base64.b64decode(raw)))
+    return img
 
 
-def tap(sid, x, y):
-    """Single tap via W3C actions."""
+def tap(sid, x, y, hold_ms=300):
+    """Tap with hold at logical coordinates."""
     payload = {
         "actions": [{
             "type": "pointer",
@@ -72,7 +66,7 @@ def tap(sid, x, y):
             "actions": [
                 {"type": "pointerMove", "duration": 0, "x": int(x), "y": int(y)},
                 {"type": "pointerDown"},
-                {"type": "pause", "duration": 120},
+                {"type": "pause", "duration": hold_ms},
                 {"type": "pointerUp"},
             ],
         }]
@@ -82,44 +76,63 @@ def tap(sid, x, y):
     return r.status_code == 200
 
 
-# ── STEP 1: Overlay dots on screenshot ───────────────────────────────────────
-print("\n=== CALIBRATION ===")
+print("\n=== CALIBRATION ===\n")
 sid = get_session()
+print(f"Session: {sid}")
 
-print("\n[1] Taking screenshot and drawing tile positions...")
-img = take_screenshot(sid).convert("RGBA")
-overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+# ── Step 1: Detect coordinate spaces ─────────────────────────────────────────
+img = take_screenshot(sid)
+screenshot_w, screenshot_h = img.size
+logical_w, logical_h = get_window_size(sid)
+
+print(f"\nScreenshot size (pixels) : {screenshot_w} x {screenshot_h}")
+print(f"Logical window size (pts): {logical_w} x {logical_h}")
+
+if logical_w == 0:
+    print("WARNING: Could not get window size — trying common scale factors")
+    scale = 3.0
+else:
+    scale = screenshot_w / logical_w
+    print(f"Scale factor             : {scale:.2f}x  (screenshot / logical)")
+
+# ── Compute logical touch coordinates ────────────────────────────────────────
+TILE_COORDS_LOGICAL = {
+    idx: (int(cx / scale), int(cy / scale))
+    for idx, (cx, cy) in TILE_COORDS_SCREEN.items()
+}
+
+print("\nLogical tap coordinates (use these in boggle_bot.py):")
+print("TILE_COORDS = {")
+for idx, (x, y) in TILE_COORDS_LOGICAL.items():
+    comma = "," if idx < 15 else ""
+    sx, sy = TILE_COORDS_SCREEN[idx]
+    print(f"    {idx:>2}: ({x:>4}, {y:>4}){comma}   # screen=({sx},{sy}) ÷ {scale:.1f}")
+print("}")
+
+# ── Step 2: Draw overlay on screenshot ───────────────────────────────────────
+overlay = img.convert("RGBA")
 draw = ImageDraw.Draw(overlay)
-
-for idx, (cx, cy) in TILE_COORDS.items():
+for idx, (cx, cy) in TILE_COORDS_SCREEN.items():
     r = 45
-    # Red circle
-    draw.ellipse([(cx - r, cy - r), (cx + r, cy + r)],
-                 outline=(255, 40, 40, 230), width=6)
-    # Filled dot at centre
-    draw.ellipse([(cx - 8, cy - 8), (cx + 8, cy + 8)],
-                 fill=(255, 40, 40, 255))
-    # Index number
-    draw.text((cx - 14, cy - 18), str(idx),
-              fill=(255, 255, 80, 255))
+    draw.ellipse([(cx-r, cy-r), (cx+r, cy+r)], outline=(255,40,40,220), width=6)
+    draw.ellipse([(cx-8, cy-8), (cx+8, cy+8)], fill=(255,40,40,255))
+    draw.text((cx-12, cy-16), str(idx), fill=(255,255,60,255))
 
-combined = Image.alpha_composite(img, overlay).convert("RGB")
-out_path = "calibration_check.png"
-combined.save(out_path)
-print(f"   Saved → {out_path}")
-print("   ▶  Open this image and check that every red circle sits on a tile.")
-print("      If they're off, update TILE_COORDS in boggle_bot.py\n")
+overlay.convert("RGB").save("calibration_check.png")
+print("\nSaved calibration_check.png")
 
-
-# ── STEP 2: Live tap test ─────────────────────────────────────────────────────
-print("[2] Tap test — watch your phone, tiles should glow 0→15 in order...")
-input("   Press ENTER when you're ready to start the tap test > ")
+# ── Step 3: Tap test with LOGICAL coords ─────────────────────────────────────
+print("\n=== TAP TEST ===")
+print("Watch your phone — each tile should glow/highlight in order 0→15")
+input("Press ENTER to start > ")
 
 for idx in range(16):
-    cx, cy = TILE_COORDS[idx]
-    ok = tap(sid, cx, cy)
-    print(f"   Tile {idx:>2}  ({cx:>4}, {cy:>4})  {'✓' if ok else '✗'}")
-    time.sleep(1.0)
+    lx, ly = TILE_COORDS_LOGICAL[idx]
+    sx, sy = TILE_COORDS_SCREEN[idx]
+    ok = tap(sid, lx, ly)
+    print(f"  Tile {idx:>2}  logical=({lx:>4},{ly:>4})  screen=({sx:>4},{sy:>4})  {'✓' if ok else '✗'}")
+    time.sleep(1.2)
 
-print("\nDone. If tiles glowed in the wrong order, the coords need adjusting.")
-print("Edit TILE_COORDS in boggle_bot.py to fix the positions.\n")
+print("\nDone.")
+print("If tiles lit up correctly → copy the TILE_COORDS block above into boggle_bot.py")
+print("If still wrong → share the output and I'll fix it.")
